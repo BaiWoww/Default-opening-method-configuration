@@ -146,3 +146,57 @@ def refresh_shell() -> None:
         ctypes.windll.shell32.SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, 0, 0)
     except Exception:
         pass
+
+
+def remove_user_override(ext: str) -> bool:
+    """Remove the HKCU override for `ext` so the system default takes effect.
+
+    Deletes the `HKCU\\Software\\Classes\\<ext>` key and the tool-generated
+    ProgID key (`DefaultOpener.<ext>file`). Returns True if anything was
+    removed. Non-existent keys are not errors.
+    """
+    ext = ext.lower()
+    if not ext.startswith("."):
+        ext = "." + ext
+    progid = progid_for(ext)
+
+    def _del_tree(root, path: str) -> bool:
+        removed = False
+        try:
+            with winreg.OpenKey(root, path, 0, winreg.KEY_READ) as k:
+                subs = []
+                i = 0
+                while True:
+                    try:
+                        subs.append(winreg.EnumKey(k, i))
+                    except OSError:
+                        break
+                    i += 1
+            for s in subs:
+                _del_tree(root, path + "\\" + s)
+            winreg.DeleteKey(root, path)
+            removed = True
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+        return removed
+
+    r1 = _del_tree(HKCU_CLASSES, f"{CLASSES_SUBKEY}\\{ext}")
+    r2 = _del_tree(HKCU_CLASSES, f"{CLASSES_SUBKEY}\\{progid}")
+    return r1 or r2
+
+
+def has_user_override(ext: str) -> bool:
+    """Return True if the user has an HKCU override for `ext`."""
+    ext = ext.lower()
+    if not ext.startswith("."):
+        ext = "." + ext
+    try:
+        with winreg.OpenKey(HKCU_CLASSES, f"{CLASSES_SUBKEY}\\{ext}") as k:
+            value, _ = winreg.QueryValueEx(k, "")
+            return bool(value)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False

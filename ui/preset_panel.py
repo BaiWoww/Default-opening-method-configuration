@@ -4,15 +4,18 @@ from __future__ import annotations
 import os
 from typing import Dict, Optional
 
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import QColor, QKeySequence, QPalette
 from PyQt5.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QMessageBox,
     QPushButton,
+    QShortcut,
     QVBoxLayout,
     QWidget,
 )
@@ -26,12 +29,14 @@ class PresetPanel(QWidget):
 
     presets_changed = pyqtSignal(str)  # emits ext when presets list modified
     default_changed = pyqtSignal(str, str)  # ext, new default label
+    status_message = pyqtSignal(str, int)  # message, duration ms
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._current_ext: Optional[str] = None
         self._configs: Dict[str, ExtensionConfig] = {}
         self._build_ui()
+        self._install_shortcuts()
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -66,6 +71,12 @@ class PresetPanel(QWidget):
         self.test_btn.clicked.connect(self._on_test)
         self.test_btn.setEnabled(False)
         cur_btn_row.addWidget(self.test_btn)
+        # B2: capture current default as preset
+        self.capture_btn = QPushButton("➕ 存为预设")
+        self.capture_btn.setToolTip("将当前默认程序保存为预设，免去重新浏览路径")
+        self.capture_btn.clicked.connect(self._on_capture_default)
+        self.capture_btn.setEnabled(False)
+        cur_btn_row.addWidget(self.capture_btn)
         cur_btn_row.addStretch(1)
         cur_layout.addLayout(cur_btn_row)
         layout.addWidget(cur_group)
@@ -77,6 +88,8 @@ class PresetPanel(QWidget):
         self.preset_list = QListWidget()
         self.preset_list.itemDoubleClicked.connect(self._on_set_default)
         self.preset_list.itemSelectionChanged.connect(self._on_preset_selection_changed)
+        self.preset_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.preset_list.customContextMenuRequested.connect(self._on_context_menu)
         pre_layout.addWidget(self.preset_list, 1)
 
         btn_row = QHBoxLayout()
@@ -94,9 +107,30 @@ class PresetPanel(QWidget):
         btn_row.addStretch(1)
         pre_layout.addLayout(btn_row)
 
+        # B4: restore system default
+        restore_row = QHBoxLayout()
+        self.restore_btn = QPushButton("↩ 恢复系统默认")
+        self.restore_btn.setToolTip(
+            "删除当前用户的关联覆盖，回到 Windows 出厂默认程序"
+        )
+        self.restore_btn.clicked.connect(self._on_restore_default)
+        self.restore_btn.setEnabled(False)
+        restore_row.addWidget(self.restore_btn)
+        restore_row.addStretch(1)
+        pre_layout.addLayout(restore_row)
+
         layout.addWidget(pre_group, 1)
 
         self._set_actions_enabled(False)
+
+    def _install_shortcuts(self) -> None:
+        # A7: keyboard shortcuts on the preset list
+        QShortcut(QKeySequence(Qt.Key_Return), self.preset_list, self._on_set_default)
+        QShortcut(QKeySequence(Qt.Key_Enter), self.preset_list, self._on_set_default)
+        QShortcut(QKeySequence.Delete, self.preset_list, self._on_del_preset)
+        QShortcut(
+            QKeySequence(Qt.Key_Escape), self.preset_list, self.preset_list.clearFocus
+        )
 
     def set_configs(self, configs: Dict[str, ExtensionConfig]) -> None:
         self._configs = configs
@@ -115,11 +149,18 @@ class PresetPanel(QWidget):
             name = os.path.basename(exe) if exe else progid or "(未知)"
             self.cur_name_label.setText(name)
             self.cur_path_label.setText(cmd)
+            self.cur_path_label.setToolTip(exe or cmd or "")
             self.test_btn.setEnabled(True)
+            self.capture_btn.setEnabled(True)
         else:
             self.cur_name_label.setText("(未关联)")
             self.cur_path_label.setText("尚未设置默认打开方式")
+            self.cur_path_label.setToolTip("")
             self.test_btn.setEnabled(False)
+            self.capture_btn.setEnabled(False)
+
+        # B4: restore availability
+        self.restore_btn.setEnabled(registry.has_user_override(ext))
 
         # Presets
         self.preset_list.clear()
@@ -134,6 +175,7 @@ class PresetPanel(QWidget):
             display += f"  {preset.args}"
         item = QListWidgetItem(display)
         item.setData(Qt.UserRole, preset.name)
+        item.setToolTip(f"{preset.name}\n路径: {preset.path}\n参数: {preset.args or '(无)'}")
         # Check if currently default
         progid, cmd, exe = registry.get_current_default(self._current_ext or "")
         if exe and exe.lower() == preset.path.lower():
@@ -164,7 +206,9 @@ class PresetPanel(QWidget):
         if dlg.exec_() != dlg.Accepted:
             return
         name, path, args = dlg.values()
-        cfg = self._configs.setdefault(self._current_ext, ExtensionConfig(ext=self._current_ext))
+        cfg = self._configs.setdefault(
+            self._current_ext, ExtensionConfig(ext=self._current_ext)
+        )
         # Replace if same name exists
         for p in cfg.presets:
             if p.name == name:
@@ -237,17 +281,71 @@ class PresetPanel(QWidget):
             registry.refresh_shell()
             self.default_changed.emit(self._current_ext, preset.path)
             self.show_extension(self._current_ext)
-            QMessageBox.information(self, "完成", f"已将 {self._current_ext} 的默认程序切换为:\n{preset.name}")
+            # A1: no modal box; flash the item + status message
+            self._flash_item(item)
+            self.status_message.emit(
+                f"已将 {self._current_ext} 默认程序切换为 {preset.name}", 3000
+            )
         else:
-            QMessageBox.critical(self, "失败", "写入注册表失败,请检查权限。")
+            QMessageBox.critical(self, "失败", "写入注册表失败，请检查权限。")
+
+    def _flash_item(self, item: QListWidgetItem) -> None:
+        """Briefly highlight an item to confirm the switch (A1)."""
+        orig_bg = item.background()
+        highlight = QPalette().highlight().color()
+        # apply via stylesheet-ish: use setBackground
+        from PyQt5.QtGui import QColor
+        item.setBackground(QColor("#a5d6a7"))
+        QTimer.singleShot(300, lambda: item.setBackground(orig_bg))
+
+    def _on_capture_default(self) -> None:
+        """B2: capture the current system default as a preset."""
+        if not self._current_ext:
+            return
+        progid, cmd, exe = registry.get_current_default(self._current_ext)
+        if not exe:
+            QMessageBox.information(self, "提示", "当前没有默认程序可捕获。")
+            return
+        name = os.path.splitext(os.path.basename(exe))[0] or "默认程序"
+        cfg = self._configs.setdefault(
+            self._current_ext, ExtensionConfig(ext=self._current_ext)
+        )
+        # dedup by path
+        for p in cfg.presets:
+            if p.path.lower() == exe.lower():
+                QMessageBox.information(self, "提示", f"预设「{p.name}」已使用该程序。")
+                return
+        cfg.presets.append(Preset(name=name, path=exe, args=""))
+        self.presets_changed.emit(self._current_ext)
+        self.show_extension(self._current_ext)
+        self.status_message.emit(f"已捕获当前默认为预设「{name}」", 3000)
+
+    def _on_restore_default(self) -> None:
+        """B4: remove the HKCU override so system default returns."""
+        if not self._current_ext:
+            return
+        ans = QMessageBox.question(
+            self,
+            "恢复系统默认",
+            f"将删除 {self._current_ext} 的当前用户关联，恢复到 Windows 出厂默认。\n继续?",
+        )
+        if ans != QMessageBox.Yes:
+            return
+        removed = registry.remove_user_override(self._current_ext)
+        if removed:
+            registry.refresh_shell()
+            self.show_extension(self._current_ext)
+            self.status_message.emit(
+                f"已恢复 {self._current_ext} 的系统默认", 3000
+            )
+        else:
+            self.status_message.emit("当前已是系统默认，无需恢复", 3000)
 
     def _on_test(self) -> None:
         if not self._current_ext:
             return
-        # Pick any existing file with this extension; if none, create a temp one
         target = self._find_sample_file(self._current_ext)
         if not target:
-            # create a small temp file with this extension
             import tempfile
 
             fd, target = tempfile.mkstemp(suffix=self._current_ext)
@@ -265,6 +363,26 @@ class PresetPanel(QWidget):
                     os.unlink(target)
                 except OSError:
                     pass
+
+    def _on_context_menu(self, pos) -> None:
+        item = self.preset_list.itemAt(pos)
+        if not item:
+            return
+        name = item.data(Qt.UserRole)
+        menu = QMenu(self)
+        act_set = menu.addAction("设为默认")
+        menu.addSeparator()
+        act_edit = menu.addAction("编辑")
+        act_del = menu.addAction("删除")
+        # select the item first so actions target it
+        self.preset_list.setCurrentItem(item)
+        action = menu.exec_(self.preset_list.viewport().mapToGlobal(pos))
+        if action is act_set:
+            self._on_set_default()
+        elif action is act_edit:
+            self._on_edit_preset()
+        elif action is act_del:
+            self._on_del_preset()
 
     def _find_sample_file(self, ext: str) -> Optional[str]:
         ext = ext.lower()
